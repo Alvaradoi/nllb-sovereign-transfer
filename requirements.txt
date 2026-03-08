@@ -1,0 +1,19 @@
+# Core Deep Learning Stack
+torch
+torchvision
+torchaudio
+
+# NLP & Model Handling
+transformers
+datasets
+sentencepiece
+protobuf
+accelerate
+evaluate
+sacrebleu
+
+# UI & Data Management
+streamlit
+pandas
+python-dotenv
+tqdm

@@ -1,36 +1,80 @@
-# ===========================
-#  DATA SOVEREIGNTY SHIELD
-# ===========================
-# Strict exclusion of all data files
+# ════════════════════════════════════════════════════════════
+# SOVEREIGNTY SHIELD
+# Linguistic data and model weights are tribal property.
+# These must NEVER be pushed to any remote repository.
+# ════════════════════════════════════════════════════════════
+
+# Data directories (contain tribal linguistic content)
 data/
 datasets/
-raw/
-processed/
-*.json
-*.jsonl
-*.csv
-*.tsv
-*.txt
-*.pdf
-*.docx
 
-# Strict exclusion of Model Weights
-*.bin
-*.pt
-*.pth
-*.safetensors
+# Model weights and checkpoints
 models/
 checkpoints/
 outputs/
 runs/
+
+# Training artifacts by extension
+*.bin
+*.pt
+*.pth
+*.safetensors
+
+# Data file formats (only excluded at root — not globally by extension)
+# NOTE: Do NOT use *.json or *.txt globally — that would block
+#       requirements.txt, README.md, and src/ config files.
+data/*.json
+data/*.jsonl
+data/*.csv
+data/*.tsv
+data/*.txt
+data/*.pdf
+data/*.docx
+data/raw/
+data/processed/
+
+# ════════════════════════════════════════════════════════════
+# CLAUDE CODE — Local config files
+# CLAUDE.md contains internal paths and governance details.
+# .claude/settings*.json may contain API keys or personal config.
+# These are LOCAL ONLY.
+# ════════════════════════════════════════════════════════════
+CLAUDE.md
+.claude/settings.json
+.claude/settings.local.json
+
+# Allow slash command definitions — these are methodology docs, no data
+!.claude/
+!.claude/commands/
+!.claude/commands/*.md
+
+# ════════════════════════════════════════════════════════════
+# MLOps tracking (local only)
+# ════════════════════════════════════════════════════════════
+mlruns/
+mlartifacts/
 wandb/
 
-# ===========================
-#  Standard Python Ignores
-# ===========================
+# ════════════════════════════════════════════════════════════
+# Standard Python
+# ════════════════════════════════════════════════════════════
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
 .venv/
 env/
+venv/
 .env
+*.egg-info/
+dist/
+build/
+
+# ════════════════════════════════════════════════════════════
+# Editors & OS
+# ════════════════════════════════════════════════════════════
+.vscode/
+.idea/
 .DS_Store
+Thumbs.db
+*.swp
