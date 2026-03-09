@@ -103,10 +103,192 @@ CONTROL_REPAIR_MAP = {
 
 CORRUPTION_SIGNALS = ["(cid:", "\x00", "\ufffd"]
 
+# ── Font CMap Patch ───────────────────────────────────────────────────────────
+#
+# Camp (2007) uses an embedded TrueType font (R40 / DXCOJF+TTFF4A94D8t00) whose
+# ToUnicode CMap maps only ONE character ('e').  For all other glyphs, PyMuPDF
+# tries to look up the glyph name in the Adobe Glyph List (AGL) — but the font
+# uses custom SIL names (wsuper, commasuprightnosp, haceknosp, etc.) that the
+# AGL doesn't know, so they all collapse to U+FFFD.
+#
+# Fix: read the font's Encoding Differences array (which has the glyph names),
+# map each name to the correct Unicode codepoint via the table below, then inject
+# a complete ToUnicode CMap into the in-memory document before any text extraction.
+#
+# Confirmed by inspection of xref 126 (Encoding) and xref 128 (ToUnicode) in
+# Camp2007.pdf.  Font R9 (xref 125) uses only standard AGL names and is fine.
+
+CUSTOM_GLYPH_UNICODE: dict[str, str] = {
+    # SIL/non-AGL glyph names found in Camp (2007) font encoding
+    # → correct Unicode for Kalispel Salish orthography
+    "wsuper":              "\u02B7",   # ʷ  MODIFIER LETTER SMALL W (labialization)
+    "apostrophesupnosp":   "\u02BC",   # ʼ  MODIFIER LETTER APOSTROPHE (ejective)
+    "commasuprightnosp":   "\u02BC",   # ʼ  same ejective marker, different glyph variant
+    "haceknosp":           "\u030C",   # ̌   COMBINING CARON (used to form x̌, etc.)
+    "macronnosp":          "\u0304",   # ̄   COMBINING MACRON
+    "dotnosp":             "\u0307",   # ̇   COMBINING DOT ABOVE
+    "dotsubnosp":          "\u0323",   # ̣   COMBINING DOT BELOW
+    "halflength":          "\u02D1",   # ˑ   MODIFIER LETTER HALF TRIANGULAR COLON
+    # Standard IPA names that the AGL may or may not carry:
+    "glottalstop":         "\u0294",   # ʔ  LATIN LETTER GLOTTAL STOP
+    "lbelt":               "\u026C",   # ɬ  LATIN SMALL LETTER L WITH BELT
+    "lambdabar":           "\u019B",   # ƛ  LATIN SMALL LETTER LAMBDA WITH STROKE
+    "schwa":               "\u0259",   # ə  LATIN SMALL LETTER SCHWA
+    "scaron":              "\u0161",   # š  LATIN SMALL LETTER S WITH CARON
+    "ccaron":              "\u010D",   # č  LATIN SMALL LETTER C WITH CARON
+}
+
+
+def _parse_differences(obj_text: str) -> dict[int, str]:
+    """
+    Parse a PDF Encoding Differences array into {char_code: glyph_name}.
+    Input is the raw xref object string from doc.xref_object().
+    """
+    # Extract content inside brackets
+    m = re.search(r'\[\s*(.*?)\s*\]', obj_text, re.DOTALL)
+    if not m:
+        return {}
+    tokens = re.findall(r'/\w+|-?\d+', m.group(1))
+    result: dict[int, str] = {}
+    code = 0
+    for tok in tokens:
+        if tok.lstrip('-').isdigit():
+            code = int(tok)
+        elif tok.startswith('/'):
+            result[code] = tok[1:]
+            code += 1
+    return result
+
+
+def _make_tounicode_cmap(entries: dict[int, str]) -> bytes:
+    """
+    Generate a ToUnicode CMap stream from {char_code: unicode_string} mapping.
+    unicode_string may be a multi-char sequence (e.g. a base + combining char).
+
+    The codespacerange is set to exactly the codes we map so that codes outside
+    this range (e.g. standard ASCII letters not in the font's Differences array)
+    fall back to PyMuPDF's glyph-name → AGL resolution rather than FFFD.
+    """
+    if not entries:
+        return b""
+    min_code = min(entries)
+    max_code = max(entries)
+    lines = [
+        "/CIDInit /ProcSet findresource begin",
+        "12 dict begin",
+        "begincmap",
+        "/CMapType 2 def",
+        "1 begincodespacerange",
+        f"<{min_code:02X}><{max_code:02X}>",
+        "endcodespacerange",
+        f"{len(entries)} beginbfchar",
+    ]
+    for code in sorted(entries):
+        uni = entries[code]
+        hex_code = f"<{code:02X}>"
+        hex_uni = "".join(f"{ord(c):04X}" for c in uni)
+        lines.append(f"{hex_code} <{hex_uni}>")
+    lines += ["endbfchar", "endcmap",
+              "CMapName currentdict /CMap defineresource pop",
+              "end end"]
+    return "\n".join(lines).encode("latin-1")
+
+
+def patch_pdf_fonts(doc) -> int:
+    """
+    Scan all fonts in the document for Encoding Differences with unresolvable
+    glyph names.  Inject a complete ToUnicode CMap so PyMuPDF resolves them
+    instead of outputting U+FFFD.
+
+    Returns the number of fonts patched.
+    """
+    # Collect xrefs of all Font objects that have an Encoding
+    patched = 0
+    seen_enc_xrefs: set[int] = set()
+
+    for pnum in range(len(doc)):
+        for f in doc.get_page_fonts(pnum):
+            font_xref = f[0]
+            font_dict_text = doc.xref_object(font_xref)
+
+            # Find the Encoding xref
+            enc_m = re.search(r'/Encoding\s+(\d+)\s+\d+\s+R', font_dict_text)
+            if not enc_m:
+                continue
+            enc_xref = int(enc_m.group(1))
+            if enc_xref in seen_enc_xrefs:
+                continue
+            seen_enc_xrefs.add(enc_xref)
+
+            enc_text = doc.xref_object(enc_xref)
+            diff_map = _parse_differences(enc_text)
+            if not diff_map:
+                continue
+
+            # Build char_code → Unicode for every glyph we can resolve
+            # Start from WinAnsiEncoding base for codes not in Differences
+            unicode_map: dict[int, str] = {}
+            for code, gname in diff_map.items():
+                uni = CUSTOM_GLYPH_UNICODE.get(gname)
+                if uni:
+                    unicode_map[code] = uni
+                    continue
+                # Try simple single-char names
+                if len(gname) == 1:
+                    unicode_map[code] = gname
+                    continue
+                # Known multi-char glyph name conventions (standard AGL subset)
+                AGL_SIMPLE = {
+                    "space": " ", "period": ".", "comma": ",", "hyphen": "-",
+                    "plus": "+", "equal": "=", "colon": ":", "semicolon": ";",
+                    "question": "?", "exclam": "!", "slash": "/",
+                    "parenleft": "(", "parenright": ")",
+                    "bracketleft": "[", "bracketright": "]",
+                    "asterisk": "*", "quotesingle": "'",
+                    "quoteright": "\u2019", "quoteleft": "\u2018",
+                    "quotedblleft": "\u201C", "quotedblright": "\u201D",
+                    "endash": "\u2013", "emdash": "\u2014",
+                    "radical": "\u221A", "underscore": "_",
+                    "zero": "0", "one": "1", "two": "2", "three": "3",
+                    "four": "4", "five": "5", "six": "6", "seven": "7",
+                    "eight": "8", "nine": "9",
+                    "oacute": "\u00F3", "eacute": "\u00E9", "aacute": "\u00E1",
+                    "uacute": "\u00FA", "iacute": "\u00ED",
+                }
+                if gname in AGL_SIMPLE:
+                    unicode_map[code] = AGL_SIMPLE[gname]
+                # Unknown names are left out — PyMuPDF already resolves them or
+                # they'll surface in the SUSPICIOUS_CONTROLS audit
+
+            if not unicode_map:
+                continue
+
+            cmap_bytes = _make_tounicode_cmap(unicode_map)
+
+            # Find or create the ToUnicode xref for this font
+            tou_m = re.search(r'/ToUnicode\s+(\d+)\s+\d+\s+R', font_dict_text)
+            if tou_m:
+                tou_xref = int(tou_m.group(1))
+                doc.update_stream(tou_xref, cmap_bytes)
+            else:
+                # Create a new stream object and link it
+                tou_xref = doc.get_new_xref()
+                doc.update_object(tou_xref, "<<>>")
+                doc.update_stream(tou_xref, cmap_bytes)
+                new_font_dict = font_dict_text.rstrip(">").rstrip() + \
+                    f"\n  /ToUnicode {tou_xref} 0 R\n>>"
+                doc.update_object(font_xref, new_font_dict)
+
+            patched += 1
+
+    return patched
+
+
 # Control chars that are NOT valid in clean Salish text
-# (anything below 0x20 except tab/newline is suspicious)
+# (anything below 0x20 except newline/CR is suspicious — tab included because
+# tabs in Salish word spans are always encoding artifacts, not layout whitespace)
 SUSPICIOUS_CONTROLS = set(chr(i) for i in range(0x01, 0x20)
-                          if i not in (0x09, 0x0a, 0x0d))
+                          if i not in (0x0a, 0x0d))
 
 
 # ── PUA Detection ─────────────────────────────────────────────────────────────
@@ -122,10 +304,10 @@ def find_pua_chars(text: str) -> list[tuple[str, str]]:
     return [(c, f"U+{ord(c):04X}") for c in text if is_pua(c)]
 
 
-def repair_text(text: str) -> tuple[str, list[str], list[str]]:
+def repair_text(text: str) -> tuple[str, list[str], list[str], list[str]]:
     """
     Apply control char, PUA, and CID repair maps in order.
-    Returns (repaired_text, unknown_pua_chars, unknown_cid_codes)
+    Returns (repaired_text, unknown_pua_chars, unknown_cid_codes, unknown_controls)
     """
     # ── Layer 1: Control character repair (catches \x15 → ʷ etc.) ──────────
     for bad, good in CONTROL_REPAIR_MAP.items():
@@ -147,10 +329,14 @@ def repair_text(text: str) -> tuple[str, list[str], list[str]]:
         text = text.replace(bad, good)
 
     # ── Layer 4: Final Unicode normalization ─────────────────────────────────
-    import unicodedata
     text = unicodedata.normalize('NFC', text)
 
-    return text, unknown_pua, unknown_cid
+    # ── Layer 5: Audit remaining suspicious control characters ───────────────
+    # SUSPICIOUS_CONTROLS chars that survive all layers are unresolved encoding
+    # artifacts. Collect them for audit output — do not silently drop them.
+    unknown_controls = [f"\\x{ord(c):02X}" for c in text if c in SUSPICIOUS_CONTROLS]
+
+    return text, unknown_pua, unknown_cid, unknown_controls
 
 
 # ── Superscript Detection ─────────────────────────────────────────────────────
@@ -251,6 +437,9 @@ def pua_audit(pdf_path: Path, page_num: int):
     Use this to build out PUA_REPAIR_MAP.
     """
     doc = fitz.open(str(pdf_path))
+    n_patched = patch_pdf_fonts(doc)
+    if n_patched:
+        print(f"[font patch] {n_patched} font(s) patched with complete ToUnicode CMap")
     page = doc[page_num - 1]
     full_text = page.get_text("text")
     doc.close()
@@ -291,6 +480,9 @@ def pua_audit(pdf_path: Path, page_num: int):
 
 def debug_page(pdf_path: Path, page_num: int):
     doc = fitz.open(str(pdf_path))
+    n_patched = patch_pdf_fonts(doc)
+    if n_patched:
+        print(f"[font patch] {n_patched} font(s) patched with complete ToUnicode CMap")
     page = doc[page_num - 1]
     blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
     median = get_page_median_fontsize(blocks)
@@ -311,22 +503,28 @@ def debug_page(pdf_path: Path, page_num: int):
                 x0, y0, x1, _ = span["bbox"]
                 size = span.get("size", 0)
                 sup = "⬆ SUPER" if is_superscript(span, median, first_y) else ""
-                # Show hex for any PUA chars
+                # Show hex for PUA chars and suspicious control chars
                 pua_info = " ".join(f"[{cp}]" for _, cp in find_pua_chars(text))
+                ctrl_info = " ".join(
+                    f"[\\x{ord(c):02X}]" for c in text if c in SUSPICIOUS_CONTROLS
+                )
+                annot = " ".join(filter(None, [pua_info, f"CTRL:{ctrl_info}" if ctrl_info else ""]))
                 print(f"  y={y0:6.1f}  x={x0:5.1f}→{x1:5.1f}  sz={size:4.1f}"
-                      f"  '{text}'  {sup} {pua_info}")
+                      f"  '{text}'  {sup} {annot}")
 
     print(f"\n{'='*70}")
     print(f"RECONSTRUCTED LINES:")
     print(f"{'='*70}")
     raw_lines = extract_page_lines(page)
     for i, line in enumerate(raw_lines, 1):
-        repaired, upua, ucid = repair_text(line)
+        repaired, upua, ucid, uctrl = repair_text(line)
         flags = ""
         if upua:
             flags += f"  PUA: {upua}"
         if ucid:
             flags += f"  CID: {ucid}"
+        if uctrl:
+            flags += f"  CTRL: {sorted(set(uctrl))}"
         print(f"  {i:3d}: {repaired}{flags}")
 
     doc.close()
@@ -338,14 +536,18 @@ def extract_pipeline(pdf_path: Path, output_path: Path,
                      start_page: int = 1, end_page: int = None,
                      audit: bool = False):
     doc = fitz.open(str(pdf_path))
+    n_patched = patch_pdf_fonts(doc)
     total = len(doc)
     end_page = end_page or total
 
     print(f"{pdf_path.name}  ({total} pages)")
+    if n_patched:
+        print(f"[font patch] {n_patched} font(s) patched with complete ToUnicode CMap")
     print(f"   Pages {start_page}–{end_page}  |  Y_TOL={Y_TOLERANCE}pt\n")
 
     all_pua: dict[str, int] = {}
     all_cid: dict[str, int] = {}
+    all_ctrl: dict[str, int] = {}
     output_lines = []
 
     for pnum in range(start_page, min(end_page + 1, total + 1)):
@@ -354,11 +556,13 @@ def extract_pipeline(pdf_path: Path, output_path: Path,
         output_lines += [f"\n{'─'*60}", f"PAGE {pnum}", f"{'─'*60}\n"]
 
         for line in raw_lines:
-            repaired, upua, ucid = repair_text(line)
+            repaired, upua, ucid, uctrl = repair_text(line)
             for u in upua:
                 all_pua[u] = all_pua.get(u, 0) + 1
             for u in ucid:
                 all_cid[u] = all_cid.get(u, 0) + 1
+            for u in uctrl:
+                all_ctrl[u] = all_ctrl.get(u, 0) + 1
             output_lines.append(repaired)
 
     doc.close()
@@ -367,25 +571,31 @@ def extract_pipeline(pdf_path: Path, output_path: Path,
         if all_pua:
             print("Unknown PUA characters (add to PUA_REPAIR_MAP):")
             for cp, n in sorted(all_pua.items(), key=lambda x: -x[1]):
-                print(f"   {cp}  ×{n}")
+                print(f"   {cp}  x{n}")
         else:
             print("No unknown PUA characters.")
         if all_cid:
             print("Unknown CID codes (add to CID_REPAIR_MAP):")
             for c, n in sorted(all_cid.items(), key=lambda x: -x[1]):
-                print(f"   \"{c}\": \"?\",   # ×{n}")
+                print(f"   \"{c}\": \"?\",   # x{n}")
         else:
             print("No unknown CID codes.")
+        if all_ctrl:
+            print("Unknown control characters (add to CONTROL_REPAIR_MAP):")
+            for c, n in sorted(all_ctrl.items(), key=lambda x: -x[1]):
+                print(f"   \"{c}\": \"?\",   # x{n}")
+        else:
+            print("No unknown control characters.")
         print()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("\n".join(output_lines))
 
-    print(f"Done → {output_path}")
-    total_issues = len(all_pua) + len(all_cid)
+    print(f"Done -> {output_path}")
+    total_issues = len(all_pua) + len(all_cid) + len(all_ctrl)
     if total_issues:
-        print(f"{total_issues} unknown character type(s) remain — run --pua-audit")
+        print(f"{total_issues} unknown character type(s) remain — run --audit or --debug-page N")
     else:
         print("Zero character artifacts in output")
 
