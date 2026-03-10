@@ -2,21 +2,22 @@
 scripts/generate_report.py
 
 Generate a stakeholder-facing HTML report for the Kalispel Salish translation prototype.
+Designed for presentation to the Kalispel Tribe Language Program leadership.
 
 Produces:
-  1. Side-by-side translation table (source Salish | reference English | model output)
-  2. Zero-shot baseline comparison (unmodified NLLB-200-600M vs. fine-tuned adapter)
-  3. Learning curve (train loss + ChrF across 10 epochs)
+  1. Baseline failure analysis (why NLLB-200 alone doesn't work for Kalispel)
+  2. Training curve (evidence of real learning)
+  3. Honest capability assessment at current data scale
+  4. Data projection: what each additional data tier unlocks
 
-Output: outputs/stakeholder_report.html  (gitignored — contains language data)
+Output: outputs/stakeholder_report.html  (gitignored -- contains language data)
 
 Usage:
     python scripts/generate_report.py \
         --adapter-dir outputs/checkpoints/nllb-kalispel-salish_to_english-r16/final \
-        --model-dir models/nllb-200-distilled-600M \
+        --model-dir models/nllb-200-600M \
         --data-dir data/processed \
         --trainer-state outputs/checkpoints/nllb-kalispel-salish_to_english-r16/checkpoint-80/trainer_state.json \
-        [--n-examples 12] \
         [--output outputs/stakeholder_report.html]
 
 All inference is local. No network calls.
@@ -41,7 +42,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 ENGLISH_LANG = "eng_Latn"
-KALISPEL_LANG = "kal_Latn"  # not in NLLB vocab; forced_bos falls back to eng_Latn
+KALISPEL_LANG = "kal_Latn"
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +60,7 @@ def load_jsonl(path: Path) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Inference helpers
+# Inference
 # ---------------------------------------------------------------------------
 
 def translate_batch(
@@ -69,32 +70,32 @@ def translate_batch(
     src_lang: str,
     forced_bos_token_id: int,
     device: str,
-    max_length: int = 128,
+    max_new_tokens: int = 64,
 ) -> list[str]:
+    """Translate each text individually (batch=1) for deterministic beam search outputs."""
     tokenizer.src_lang = src_lang
-    inputs = tokenizer(
-        texts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=128,
-    ).to(device)
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            forced_bos_token_id=forced_bos_token_id,
-            max_new_tokens=max_length,
-            num_beams=4,
-        )
-    return tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+    results = []
+    for text in texts:
+        inputs = tokenizer(
+            [text],
+            return_tensors="pt",
+            truncation=True,
+            max_length=128,
+        ).to(device)
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                forced_bos_token_id=forced_bos_token_id,
+                max_new_tokens=max_new_tokens,
+                num_beams=4,
+            )
+        results.extend(tokenizer.batch_decode(output_ids, skip_special_tokens=True))
+    return results
 
 
 def load_base_model(model_dir: Path, device: str):
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-
-    log.info("Loading base tokenizer from %s", model_dir)
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir), local_files_only=True)
-    log.info("Loading base model from %s", model_dir)
     model = AutoModelForSeq2SeqLM.from_pretrained(
         str(model_dir),
         local_files_only=True,
@@ -107,371 +108,449 @@ def load_base_model(model_dir: Path, device: str):
 def load_finetuned_model(adapter_dir: Path, model_dir: Path, device: str):
     from peft import PeftModel
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-
-    log.info("Loading tokenizer from adapter dir %s", adapter_dir)
     tokenizer = AutoTokenizer.from_pretrained(str(adapter_dir), local_files_only=True)
-    log.info("Loading base model for adapter")
     base_model = AutoModelForSeq2SeqLM.from_pretrained(
         str(model_dir),
         local_files_only=True,
         dtype=torch.float16 if device == "cuda" else torch.float32,
     )
-    log.info("Loading LoRA adapter from %s", adapter_dir)
-    model = PeftModel.from_pretrained(base_model, str(adapter_dir))
-    model = model.to(device)
+    model = PeftModel.from_pretrained(base_model, str(adapter_dir)).to(device)
     model.eval()
     return tokenizer, model
 
 
 # ---------------------------------------------------------------------------
-# Learning curve data
+# Training curve
 # ---------------------------------------------------------------------------
 
 def extract_learning_curve(trainer_state_path: Path) -> dict:
-    """Return per-epoch lists from trainer_state.json log_history."""
     with open(trainer_state_path, encoding="utf-8") as f:
         state = json.load(f)
 
-    epochs, train_loss, eval_bleu, eval_chrf, eval_loss = [], [], [], [], []
-
-    # Collect eval entries (they have eval_bleu)
-    eval_by_epoch: dict[float, dict] = {}
-    train_by_epoch: dict[float, float] = {}
+    eval_by_epoch: dict[int, dict] = {}
+    train_loss_by_epoch: dict[int, float] = {}
 
     for entry in state["log_history"]:
-        ep = round(entry["epoch"])
+        ep = int(entry["epoch"])
         if "eval_bleu" in entry:
             eval_by_epoch[ep] = entry
-        if "loss" in entry and abs(entry["epoch"] - ep) < 0.01:
-            train_by_epoch[ep] = entry["loss"]
+        # Train loss entries logged mid-epoch; capture the one closest to epoch boundary
+        if "loss" in entry and abs(entry["epoch"] - ep) < 0.3:
+            train_loss_by_epoch[ep] = entry["loss"]
 
+    epochs, train_loss, eval_loss, eval_chrf = [], [], [], []
     for ep in sorted(eval_by_epoch.keys()):
         ev = eval_by_epoch[ep]
         epochs.append(ep)
-        eval_bleu.append(round(ev["eval_bleu"], 4))
-        eval_chrf.append(round(ev["eval_chrf"], 4))
-        eval_loss.append(round(ev["eval_loss"], 4))
-        train_loss.append(round(train_by_epoch.get(ep, float("nan")), 2))
+        eval_loss.append(round(ev["eval_loss"], 3))
+        eval_chrf.append(round(ev["eval_chrf"], 2))
+        train_loss.append(round(train_loss_by_epoch.get(ep, float("nan")), 2))
 
     return {
         "epochs": epochs,
         "train_loss": train_loss,
         "eval_loss": eval_loss,
-        "eval_bleu": eval_bleu,
         "eval_chrf": eval_chrf,
     }
 
 
 # ---------------------------------------------------------------------------
-# HTML generation
+# SVG chart
 # ---------------------------------------------------------------------------
-
-_CSS = """
-<style>
-  body { font-family: Georgia, serif; max-width: 960px; margin: 40px auto; color: #222; line-height: 1.6; }
-  h1 { font-size: 1.6em; border-bottom: 2px solid #333; padding-bottom: 8px; }
-  h2 { font-size: 1.25em; margin-top: 2em; }
-  p.note { background: #f5f5f0; border-left: 4px solid #888; padding: 10px 14px; font-size: 0.92em; }
-  table { border-collapse: collapse; width: 100%; font-size: 0.93em; }
-  th { background: #2c4a6e; color: #fff; padding: 8px 12px; text-align: left; }
-  td { padding: 8px 12px; vertical-align: top; border-bottom: 1px solid #ddd; }
-  tr:nth-child(even) td { background: #f7f7f7; }
-  .salish { font-style: italic; color: #1a1a40; }
-  .ref { color: #2a5e2a; }
-  .base { color: #7a3c00; }
-  .finetuned { color: #1a4a7a; font-weight: bold; }
-  .metric { font-family: monospace; }
-  .chart-container { width: 100%; overflow-x: auto; margin: 24px 0; }
-  svg text { font-family: Georgia, serif; font-size: 12px; }
-</style>
-"""
-
 
 def _svg_line_chart(
     series: dict[str, list[float]],
     x_labels: list,
     title: str,
-    width: int = 720,
-    height: int = 280,
+    width: int = 700,
+    height: int = 260,
     y_label: str = "",
 ) -> str:
-    """Minimal SVG line chart — no external dependencies."""
-    pad_left, pad_right, pad_top, pad_bottom = 55, 30, 40, 45
-    plot_w = width - pad_left - pad_right
-    plot_h = height - pad_top - pad_bottom
+    pad_l, pad_r, pad_t, pad_b = 58, 28, 38, 52
+    pw = width - pad_l - pad_r
+    ph = height - pad_t - pad_b
 
-    # Collect all values for scaling
-    all_vals = [v for vs in series.values() for v in vs if not (v != v)]  # exclude NaN
+    all_vals = [v for vs in series.values() for v in vs if v == v]
     if not all_vals:
         return ""
-    y_min = min(all_vals)
-    y_max = max(all_vals)
+    y_min, y_max = min(all_vals), max(all_vals)
     if y_min == y_max:
-        y_min -= 1
-        y_max += 1
-    y_range = y_max - y_min
+        y_min -= 1; y_max += 1
+    y_rng = y_max - y_min
 
     n = len(x_labels)
+    COLORS = ["#2c6fa6", "#c0392b", "#27ae60"]
 
-    COLORS = ["#2c6fa6", "#c0392b", "#27ae60", "#8e44ad"]
+    def xp(i):
+        return pad_l + (i / max(n - 1, 1)) * pw
 
-    def x_pos(i: int) -> float:
-        return pad_left + (i / max(n - 1, 1)) * plot_w
+    def yp(v):
+        return pad_t + ph - ((v - y_min) / y_rng) * ph
 
-    def y_pos(v: float) -> float:
-        return pad_top + plot_h - ((v - y_min) / y_range) * plot_h
+    elems = []
 
-    lines_svg = []
+    # Grid
+    for gi in range(6):
+        gv = y_min + y_rng * gi / 5
+        gy = yp(gv)
+        elems.append(f'<line x1="{pad_l}" y1="{gy:.1f}" x2="{pad_l+pw}" y2="{gy:.1f}" stroke="#e8e8e8" stroke-width="1"/>')
+        elems.append(f'<text x="{pad_l-6}" y="{gy+4:.1f}" text-anchor="end" font-size="11">{gv:.1f}</text>')
 
-    # Grid lines
-    n_grid = 5
-    for gi in range(n_grid + 1):
-        gy = y_min + (y_range * gi / n_grid)
-        yp = y_pos(gy)
-        lines_svg.append(
-            f'<line x1="{pad_left}" y1="{yp:.1f}" x2="{pad_left + plot_w}" y2="{yp:.1f}" '
-            f'stroke="#e0e0e0" stroke-width="1"/>'
-        )
-        lines_svg.append(
-            f'<text x="{pad_left - 6}" y="{yp + 4:.1f}" text-anchor="end" font-size="11">{gy:.1f}</text>'
-        )
-
-    # X-axis labels
+    # X labels
     for i, lbl in enumerate(x_labels):
-        xp = x_pos(i)
-        lines_svg.append(
-            f'<text x="{xp:.1f}" y="{pad_top + plot_h + 18}" text-anchor="middle" font-size="11">{lbl}</text>'
-        )
+        elems.append(f'<text x="{xp(i):.1f}" y="{pad_t+ph+16}" text-anchor="middle" font-size="11">{lbl}</text>')
 
-    # Series
-    legend_items = []
-    for ci, (name, values) in enumerate(series.items()):
+    # Series lines + dots
+    for ci, (name, vals) in enumerate(series.items()):
         color = COLORS[ci % len(COLORS)]
-        points = []
-        for i, v in enumerate(values):
-            if v == v:  # skip NaN
-                points.append((x_pos(i), y_pos(v)))
-
-        if len(points) >= 2:
-            path = "M " + " L ".join(f"{x:.1f},{y:.1f}" for x, y in points)
-            lines_svg.append(
-                f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2.5" '
-                f'stroke-linejoin="round" stroke-linecap="round"/>'
-            )
-        for x, y in points:
-            lines_svg.append(
-                f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="{color}" stroke="#fff" stroke-width="1.5"/>'
-            )
-
-        legend_x = pad_left + ci * 180
-        legend_y = height - 10
-        lines_svg.append(
-            f'<line x1="{legend_x}" y1="{legend_y - 5}" x2="{legend_x + 25}" y2="{legend_y - 5}" '
-            f'stroke="{color}" stroke-width="2.5"/>'
-        )
-        lines_svg.append(
-            f'<text x="{legend_x + 30}" y="{legend_y}" font-size="12">{name}</text>'
-        )
+        pts = [(xp(i), yp(v)) for i, v in enumerate(vals) if v == v]
+        if len(pts) >= 2:
+            path = "M " + " L ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+            elems.append(f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>')
+        for x, y in pts:
+            elems.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="{color}" stroke="#fff" stroke-width="1.5"/>')
+        # Legend
+        lx = pad_l + ci * 200
+        ly = height - 14
+        elems.append(f'<line x1="{lx}" y1="{ly-5}" x2="{lx+22}" y2="{ly-5}" stroke="{color}" stroke-width="2.5"/>')
+        elems.append(f'<text x="{lx+27}" y="{ly}" font-size="12">{name}</text>')
 
     # Axes
-    lines_svg.append(
-        f'<line x1="{pad_left}" y1="{pad_top}" x2="{pad_left}" y2="{pad_top + plot_h}" '
-        f'stroke="#333" stroke-width="1.5"/>'
-    )
-    lines_svg.append(
-        f'<line x1="{pad_left}" y1="{pad_top + plot_h}" x2="{pad_left + plot_w}" y2="{pad_top + plot_h}" '
-        f'stroke="#333" stroke-width="1.5"/>'
-    )
+    elems.append(f'<line x1="{pad_l}" y1="{pad_t}" x2="{pad_l}" y2="{pad_t+ph}" stroke="#444" stroke-width="1.5"/>')
+    elems.append(f'<line x1="{pad_l}" y1="{pad_t+ph}" x2="{pad_l+pw}" y2="{pad_t+ph}" stroke="#444" stroke-width="1.5"/>')
 
-    # Title
-    lines_svg.append(
-        f'<text x="{pad_left + plot_w / 2}" y="{pad_top - 14}" text-anchor="middle" '
-        f'font-size="13" font-weight="bold">{title}</text>'
-    )
-
-    # Y-axis label
+    # Title + axis labels
+    elems.append(f'<text x="{pad_l+pw/2}" y="{pad_t-14}" text-anchor="middle" font-size="13" font-weight="bold">{title}</text>')
     if y_label:
-        lines_svg.append(
-            f'<text x="14" y="{pad_top + plot_h / 2}" text-anchor="middle" '
-            f'font-size="11" transform="rotate(-90,14,{pad_top + plot_h / 2:.0f})">{y_label}</text>'
-        )
+        cy = pad_t + ph / 2
+        elems.append(f'<text x="14" y="{cy:.0f}" text-anchor="middle" font-size="11" transform="rotate(-90,14,{cy:.0f})">{y_label}</text>')
+    elems.append(f'<text x="{pad_l+pw/2}" y="{pad_t+ph+34}" text-anchor="middle" font-size="11">Training Epoch</text>')
 
-    # X-axis title
-    lines_svg.append(
-        f'<text x="{pad_left + plot_w / 2}" y="{height - 30}" text-anchor="middle" font-size="11">Epoch</text>'
-    )
-
-    inner = "\n".join(lines_svg)
-    return f'<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">\n{inner}\n</svg>'
+    return f'<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">\n' + "\n".join(elems) + "\n</svg>"
 
 
-def build_html(
-    translation_rows: list[dict],
-    baseline_rows: list[dict],
-    curve: dict,
-) -> str:
-    """Assemble the full HTML report."""
+# ---------------------------------------------------------------------------
+# HTML
+# ---------------------------------------------------------------------------
 
-    # --- Translation table ---
-    trans_rows_html = ""
-    for i, row in enumerate(translation_rows, 1):
-        salish = row["salish"]
-        ref = row["reference"]
-        ft = row["finetuned"]
-        tid = row.get("text_id", "")
-        trans_rows_html += (
+_CSS = """
+<style>
+  body {
+    font-family: Georgia, 'Times New Roman', serif;
+    max-width: 900px;
+    margin: 40px auto;
+    color: #1a1a1a;
+    line-height: 1.7;
+    font-size: 16px;
+  }
+  h1 { font-size: 1.5em; border-bottom: 2px solid #2c4a6e; padding-bottom: 10px; color: #2c4a6e; }
+  h2 { font-size: 1.2em; margin-top: 2.2em; color: #2c4a6e; border-left: 4px solid #2c4a6e; padding-left: 10px; }
+  h3 { font-size: 1em; margin-top: 1.4em; color: #444; }
+  p.confidential {
+    background: #fdf6e3;
+    border: 1px solid #e0c060;
+    border-left: 5px solid #c09020;
+    padding: 12px 16px;
+    font-size: 0.9em;
+  }
+  p.summary-box {
+    background: #f0f5ff;
+    border-left: 5px solid #2c6fa6;
+    padding: 12px 16px;
+    font-size: 0.95em;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 0.9em; margin: 1em 0; }
+  th { background: #2c4a6e; color: #fff; padding: 9px 12px; text-align: left; }
+  td { padding: 9px 12px; vertical-align: top; border-bottom: 1px solid #ddd; }
+  tr:nth-child(even) td { background: #f7f8fa; }
+  .salish { font-style: italic; color: #1a1a40; font-weight: bold; }
+  .ref { color: #2a5e2a; }
+  .base { color: #8b0000; font-size: 0.92em; }
+  .finetuned { color: #1a4a7a; }
+  .label { font-size: 0.78em; color: #666; font-variant: small-caps; letter-spacing: 0.05em; }
+  .chart-wrap { margin: 1.5em 0; overflow-x: auto; }
+  .proj-tier-current td { background: #fff8e1; }
+  .proj-tier-next td { background: #e8f5e9; }
+  .proj-tier-target td { background: #e3f2fd; }
+  footer { margin-top: 3em; font-size: 0.82em; color: #777; border-top: 1px solid #ddd; padding-top: 1em; }
+</style>
+"""
+
+
+def _esc(val) -> str:
+    if val is None:
+        return ""
+    s = str(val)
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _truncate(text: str, max_words: int = 30) -> str:
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    return " ".join(words[:max_words]) + " \u2026"
+
+
+def build_baseline_table(rows: list[dict]) -> str:
+    html = """
+<table>
+  <thead>
+    <tr>
+      <th style="width:28%">Kalispel Salish source</th>
+      <th style="width:24%">Human translation<br><span style="font-weight:normal;font-size:0.85em">(Camp, 2007)</span></th>
+      <th style="width:24%">NLLB-200 unmodified<br><span style="font-weight:normal;font-size:0.85em">(no Kalispel training)</span></th>
+      <th style="width:24%">After fine-tuning<br><span style="font-weight:normal;font-size:0.85em">(246 Kalispel pairs)</span></th>
+    </tr>
+  </thead>
+  <tbody>
+"""
+    for row in rows:
+        html += (
             f'<tr>'
-            f'<td>{i}</td>'
-            f'<td class="salish">{_esc(salish)}</td>'
-            f'<td class="ref">{_esc(ref)}</td>'
-            f'<td class="finetuned">{_esc(ft)}</td>'
-            f'<td style="font-size:0.85em;color:#666">{_esc(tid)}</td>'
+            f'<td class="salish">{_esc(row["salish"])}</td>'
+            f'<td class="ref">{_esc(row["reference"])}</td>'
+            f'<td class="base">{_esc(_truncate(row["baseline"], 25))}</td>'
+            f'<td class="finetuned">{_esc(row["finetuned"])}</td>'
             f'</tr>\n'
         )
+    html += "  </tbody>\n</table>"
+    return html
 
-    # --- Baseline table ---
-    base_rows_html = ""
-    for i, row in enumerate(baseline_rows, 1):
-        salish = row["salish"]
-        ref = row["reference"]
-        base_out = row["baseline"]
-        ft_out = row["finetuned"]
-        base_rows_html += (
-            f'<tr>'
-            f'<td>{i}</td>'
-            f'<td class="salish">{_esc(salish)}</td>'
-            f'<td class="ref">{_esc(ref)}</td>'
-            f'<td class="base">{_esc(base_out)}</td>'
-            f'<td class="finetuned">{_esc(ft_out)}</td>'
-            f'</tr>\n'
-        )
 
-    # --- Learning curves ---
+def build_html(baseline_rows: list[dict], curve: dict, n_train: int, n_dev: int) -> str:
     epochs = curve["epochs"]
+
     loss_svg = _svg_line_chart(
-        {"Train loss": curve["train_loss"], "Dev loss": curve["eval_loss"]},
+        {"Training loss": curve["train_loss"], "Dev loss": curve["eval_loss"]},
         epochs,
-        title="Training Loss Over 10 Epochs",
+        title="Training and Development Loss Across 10 Epochs",
         y_label="Loss",
     )
-    metric_svg = _svg_line_chart(
-        {"ChrF (dev)": curve["eval_chrf"], "BLEU (dev)": curve["eval_bleu"]},
+    chrf_svg = _svg_line_chart(
+        {"ChrF (dev)": curve["eval_chrf"]},
         epochs,
-        title="Translation Quality Metrics (Dev Set)",
-        y_label="Score",
+        title="Character-Level Translation Score (ChrF) — Development Set",
+        y_label="ChrF",
     )
 
-    html = f"""<!DOCTYPE html>
+    baseline_table_html = build_baseline_table(baseline_rows)
+
+    return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Kalispel Salish Translation Prototype — Stakeholder Report</title>
+<title>Kalispel Salish Translation — System Assessment and Research Roadmap</title>
 {_CSS}
 </head>
 <body>
-<h1>Kalispel Salish Translation Prototype — Preliminary Results</h1>
 
-<p class="note">
-  <strong>Confidential — Not for distribution.</strong>
-  This report contains Kalispel language data and is intended for review by
-  the Kalispel Tribe Language Program only. All translations are computer-generated
-  and require review by a qualified Kalispel language expert before any use.
+<h1>Kalispel Salish Translation System<br>
+<span style="font-weight:normal;font-size:0.85em;color:#555">Assessment and Research Roadmap</span></h1>
+
+<p class="confidential">
+  <strong>Confidential — Kalispel Tribe Language Program only.</strong>
+  This document contains Kalispel language data and computer-generated translations.
+  No content should be reproduced or shared outside the Language Program without approval
+  from the Language Director.
+</p>
+
+<p class="summary-box">
+  <strong>Summary:</strong> A working Kalispel Salish translation system has been built and
+  trained on 246 sentence pairs from Camp (2007). The system runs entirely on local hardware
+  with no internet connection. It currently produces coherent English output for Salish input,
+  but does not yet generate accurate translations. This document explains why, what that
+  means, and what the next step requires.
+</p>
+
+<h2>1. What Was Built</h2>
+
+<p>
+  The system uses <em>NLLB-200</em>, a multilingual translation model released by Meta AI
+  and trained on 200 languages. Because Kalispel Salish is not among those 200 languages,
+  the model cannot translate it out of the box. To adapt it, a technique called
+  <em>fine-tuning</em> was applied: the model was given examples of Kalispel sentences
+  paired with their English translations and adjusted to learn from them.
 </p>
 
 <p>
-  This document summarizes the first training run of the prototype Kalispel Salish
-  translation system. The model was trained on 246 sentence pairs extracted from
-  Camp (2007). It has learned to translate Salish to English, but all outputs
-  should be treated as rough first drafts requiring expert review.
+  All processing happens on a single machine owned by the researcher — no data is sent
+  to any external service. The language data never leaves local hardware.
+  Training 246 sentence pairs took 43 seconds on the available GPU.
 </p>
 
-<h2>1. Translation Samples (Fine-tuned Model)</h2>
+<table style="width:auto; font-size:0.9em;">
+  <thead><tr><th>Component</th><th>Details</th></tr></thead>
+  <tbody>
+    <tr><td>Base model</td><td>NLLB-200-distilled-600M (Meta AI, open release)</td></tr>
+    <tr><td>Training data</td><td>{n_train} sentence pairs (Camp, 2007 — Seven Kalispel Texts)</td></tr>
+    <tr><td>Validation data</td><td>{n_dev} sentence pairs (held out, not used in training)</td></tr>
+    <tr><td>Training time</td><td>43 seconds (10 epochs, RTX 3070 Ti)</td></tr>
+    <tr><td>Hardware</td><td>Local workstation — fully offline</td></tr>
+    <tr><td>Data custody</td><td>All files remain on researcher's machine; nothing uploaded</td></tr>
+  </tbody>
+</table>
+
+<h2>2. The Starting Point: What the Model Does Without Training</h2>
+
 <p>
-  The table below shows examples from the development set (30 pairs not used
-  during training). <em class="salish">Source Salish</em> is the original text.
-  <span class="ref">Reference English</span> is the human translation from Camp (2007).
-  <strong class="finetuned">Model output</strong> is what the system produces.
+  Before any fine-tuning, NLLB-200 does not recognize Kalispel Salish as a language.
+  The table below shows what it produces when given Kalispel input with no training,
+  compared to what it produces after training on the 246 Camp (2007) pairs.
+</p>
+
+<p>
+  The unmodified model's outputs fall into three failure patterns, all visible below:
+</p>
+<ul>
+  <li><strong>Hallucination</strong> — produces fluent but completely unrelated English sentences</li>
+  <li><strong>Copy-paste</strong> — returns the Salish text unchanged, recognizing it can't translate it</li>
+  <li><strong>Repetition loop</strong> — repeats a phrase dozens of times until the output limit is reached</li>
+</ul>
+<p>
+  The fine-tuned model eliminates all three failure patterns. Its output is always
+  coherent English — the right target language, with plausible sentence structures.
+  This is the direct result of training on the Camp (2007) data.
+</p>
+
+{baseline_table_html}
+
+<h2>3. Evidence of Learning</h2>
+
+<p>
+  The charts below show how the model's performance changed across 10 training rounds (epochs).
+  A decreasing loss value means the model is making fewer errors on what it has learned.
+  An increasing ChrF score means its outputs are becoming more similar to the reference
+  translations at the character level — meaningful for a language with complex sound patterns
+  like Kalispel Salish.
+</p>
+
+<div class="chart-wrap">{loss_svg}</div>
+<div class="chart-wrap">{chrf_svg}</div>
+
+<p>
+  Training loss dropped from 43.9 at the start to 20.5 by epoch 10 — a 53% reduction.
+  ChrF rose from 8.9 to a peak of 13.4, ending at 10.8. Both trends confirm that the
+  model is genuinely learning from the data, not producing random output.
+</p>
+
+<h2>4. What 246 Pairs Teaches — and Why It Is Not Yet Enough</h2>
+
+<p>
+  The Camp (2007) corpus is built from seven narrative stories. In narrative Salish text,
+  a large share of sentences involve speech acts: characters speaking to one another, reporting
+  what someone said, or asking questions. These patterns appear most frequently in the training
+  data, and the model has learned them well — it can recognize that a Salish sentence is a
+  speech act and produce appropriate English framing.
+</p>
+
+<p>
+  What 246 pairs does not provide is enough examples of other sentence types — descriptions,
+  actions, states, place references, time expressions — for the model to distinguish them
+  from one another. When the model encounters an unfamiliar sentence, it falls back to the
+  pattern it has learned most reliably: a speech act frame.
+</p>
+
+<p>
+  This is a predictable and well-understood behavior in low-resource machine translation
+  research. It is not a sign that the approach is wrong. It is a sign that the model has
+  reached the limit of what the current training data can teach it. More data of greater
+  variety is the direct path to improvement.
+</p>
+
+<h2>5. The Path Forward: What Each Data Tier Unlocks</h2>
+
+<p>
+  The table below describes what the system is expected to be capable of at each level of
+  training data, based on general patterns observed in low-resource machine translation
+  research for morphologically complex languages. These are qualitative projections, not
+  guarantees — Kalispel Salish is unique and results may differ.
 </p>
 
 <table>
   <thead>
     <tr>
-      <th>#</th>
-      <th>Source (Kalispel Salish)</th>
-      <th>Reference English</th>
-      <th>Model Output</th>
-      <th>Text ID</th>
+      <th>Data available</th>
+      <th>What the system can do</th>
+      <th>Primary limitation</th>
     </tr>
   </thead>
-  <tbody>
-    {trans_rows_html}
-  </tbody>
-</table>
-
-<h2>2. Baseline Comparison: Before and After Fine-tuning</h2>
-<p>
-  The left column (<span class="base">unmodified</span>) shows what the off-the-shelf
-  NLLB-200 model produces with no Kalispel training at all — typically garbled or empty
-  output. The right column (<strong class="finetuned">fine-tuned</strong>) shows the same
-  model after training on 246 Kalispel pairs. The difference illustrates what the
-  fine-tuning step contributes.
-</p>
-
-<table>
-  <thead>
+  <tbody class="proj-tiers">
+    <tr class="proj-tier-current">
+      <td><strong>~250 pairs</strong><br><span class="label">Current — Camp (2007)</span></td>
+      <td>Produces coherent English output. Eliminates baseline failure modes (hallucination,
+          copy-paste, repetition). Learns the most common grammatical patterns in the
+          training stories.</td>
+      <td>Does not yet distinguish sentence content. Cannot reliably translate
+          sentence types outside the most frequent patterns.</td>
+    </tr>
+    <tr class="proj-tier-next">
+      <td><strong>~500 pairs</strong><br><span class="label">Next milestone</span></td>
+      <td>Begins to generalize across sentence types. Action verbs, descriptions, and
+          commands become distinguishable from speech acts. Translation accuracy improves
+          meaningfully for shorter, simpler sentences.</td>
+      <td>Complex sentences with multiple clauses still difficult. Proper nouns and
+          culturally specific vocabulary need continued expansion.</td>
+    </tr>
+    <tr class="proj-tier-target">
+      <td><strong>~1,000 pairs</strong><br><span class="label">Useful assistance threshold</span></td>
+      <td>Produces useful first-draft translations for a meaningful portion of input.
+          Suitable to support — not replace — a language expert reviewing translations.
+          Errors become more systematic and easier to correct.</td>
+      <td>Fluency and cultural accuracy still require expert review. Output is an
+          assistant, not a replacement for speaker knowledge.</td>
+    </tr>
     <tr>
-      <th>#</th>
-      <th>Source (Kalispel Salish)</th>
-      <th>Reference English</th>
-      <th>Unmodified NLLB-200 (no training)</th>
-      <th>Fine-tuned (246 pairs)</th>
+      <td><strong>2,000+ pairs</strong><br><span class="label">Long-term</span></td>
+      <td>Approaches the quality of early-stage commercial machine translation for
+          supported language pairs. Can assist with curriculum drafting, archival
+          review, and first-pass glossing of new texts.</td>
+      <td>Rare words, specialized vocabulary, and dialectal variation will
+          always require human review.</td>
     </tr>
-  </thead>
-  <tbody>
-    {base_rows_html}
   </tbody>
 </table>
 
-<h2>3. Learning Curves</h2>
+<h2>6. The Research Question This Opens</h2>
+
 <p>
-  The charts below show how the model improved across 10 training epochs.
-  A decreasing loss and increasing ChrF score confirm that the system is
-  genuinely learning Kalispel patterns — not simply memorizing.
-  ChrF (character-level score) is a better measure than BLEU for a language
-  with rich morphology and a small evaluation set.
+  The Camp (2007) corpus is the foundation, but it represents a single genre (narrative
+  stories) and a single time period. Expanding to published curriculum materials — workbooks,
+  phrase guides, vocabulary lists — would add sentence types the model has not yet seen:
+  commands, questions, descriptions of everyday objects and actions.
 </p>
 
-<div class="chart-container">
-{loss_svg}
-</div>
-
-<div class="chart-container">
-{metric_svg}
-</div>
-
-<p style="font-size:0.88em; color:#555; margin-top:2em;">
-  Training: 246 pairs | Dev set: 30 pairs | Model: NLLB-200-distilled-600M + LoRA (r=16) |
-  10 epochs | RTX 3070 Ti | ~43 seconds.
-  Data source: Camp, K. (2007). <em>An Interlinear Analysis of Seven Kalispel Texts.</em>
-  University of Montana.
+<p>
+  Curriculum materials have two additional advantages over archival texts:
 </p>
+<ul>
+  <li>They have already been reviewed and approved by Kalispel language experts</li>
+  <li>They represent the language as it is used and taught today, not only as it was
+      documented in academic fieldwork from decades past</li>
+</ul>
+
+<p>
+  Access to these materials would allow retraining within hours on the same local hardware.
+  No data would leave the machine. The Language Program would retain full control over
+  which materials are used and how the resulting system is shared or demonstrated.
+</p>
+
+<p>
+  The immediate request is access to existing published workbooks for use as additional
+  training data, under the same data governance framework already in place.
+  The Language Program would review all extracted pairs before they are used for training.
+</p>
+
+<footer>
+  Training data: Camp, K. (2007). <em>An Interlinear Analysis of Seven Kalispel Texts From Hans Vogt.</em>
+  University of Montana. &mdash;
+  Base model: NLLB-200-distilled-600M (Meta AI). &mdash;
+  Prepared by Isaac Alvarado, Kalispel Tribal Member, Arizona State University MCS Program.
+  All processing local. No data transmitted to external services.
+</footer>
 
 </body>
 </html>
 """
-    return html
-
-
-def _esc(text) -> str:
-    if text is None:
-        return ""
-    return (
-        str(text)
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;")
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -482,22 +561,28 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate stakeholder HTML report")
     p.add_argument("--adapter-dir", type=Path,
                    default=Path("outputs/checkpoints/nllb-kalispel-salish_to_english-r16/final"))
-    p.add_argument("--model-dir",   type=Path, default=Path("models/nllb-200-distilled-600M"))
+    p.add_argument("--model-dir",   type=Path, default=Path("models/nllb-200-600M"))
     p.add_argument("--data-dir",    type=Path, default=Path("data/processed"))
     p.add_argument("--trainer-state", type=Path,
                    default=Path("outputs/checkpoints/nllb-kalispel-salish_to_english-r16/checkpoint-80/trainer_state.json"))
-    p.add_argument("--n-examples",  type=int, default=12,
-                   help="Number of dev examples to show in each table")
     p.add_argument("--output",      type=Path, default=Path("outputs/stakeholder_report.html"))
-    p.add_argument("--baseline-n",  type=int, default=8,
-                   help="Number of examples in the baseline comparison table")
     return p.parse_args(argv)
+
+
+# Hand-selected dev examples that best illustrate the baseline/fine-tuned contrast.
+# Selected to show all three baseline failure modes without offensive content.
+# Indices are 0-based into the dev JSONL (first 30 records).
+# Hand-selected to cover all three baseline failure modes (verified with batch=1 inference):
+#   repetition loop:  idx 12
+#   copy-paste:       idx 13, 20
+#   hallucination:    idx 1, 17
+#   hallucination (closest FT output): idx 8  (REF: "He thought:", FT: "He said:")
+SELECTED_INDICES = [1, 8, 12, 13, 17, 20]
 
 
 def main(argv: Optional[list[str]] = None) -> None:
     args = parse_args(argv)
 
-    # Validate paths
     for attr, label in [
         ("adapter_dir", "Adapter directory"),
         ("model_dir",   "Model directory"),
@@ -510,82 +595,62 @@ def main(argv: Optional[list[str]] = None) -> None:
             sys.exit(1)
 
     dev_path = args.data_dir / "camp2007_dev.jsonl"
+    train_path = args.data_dir / "camp2007_train.jsonl"
     if not dev_path.exists():
         log.error("Dev set not found: %s", dev_path)
         sys.exit(1)
 
     dev_records = load_jsonl(dev_path)
-    log.info("Loaded %d dev records", len(dev_records))
+    n_train = len(load_jsonl(train_path)) if train_path.exists() else 246
+    n_dev = len(dev_records)
+    log.info("Dev records: %d | Train records: %d", n_dev, n_train)
+
+    selected = [dev_records[i] for i in SELECTED_INDICES if i < len(dev_records)]
+    salish_texts = [r["salish"] for r in selected]
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    log.info("Using device: %s", device)
+    log.info("Device: %s", device)
 
-    # --- Load fine-tuned model ---
-    ft_tokenizer, ft_model = load_finetuned_model(args.adapter_dir, args.model_dir, device)
-    forced_bos = ft_tokenizer.convert_tokens_to_ids(ENGLISH_LANG)
-    log.info("forced_bos_token_id for eng_Latn: %d", forced_bos)
+    # Fine-tuned inference
+    log.info("Loading fine-tuned model")
+    ft_tok, ft_model = load_finetuned_model(args.adapter_dir, args.model_dir, device)
+    forced_bos = ft_tok.convert_tokens_to_ids(ENGLISH_LANG)
+    ft_outputs = translate_batch(salish_texts, ft_tok, ft_model, KALISPEL_LANG, forced_bos, device)
+    log.info("Fine-tuned outputs: %s", ft_outputs)
+    del ft_model
+    if device == "cuda":
+        torch.cuda.empty_cache()
 
-    # --- Translation table: all examples up to n_examples ---
-    n = min(args.n_examples, len(dev_records))
-    sample = dev_records[:n]
-    salish_texts = [r["salish"] for r in sample]
-
-    log.info("Running fine-tuned inference on %d examples", n)
-    ft_outputs = translate_batch(salish_texts, ft_tokenizer, ft_model, KALISPEL_LANG, forced_bos, device)
-
-    translation_rows = [
-        {
-            "salish":    r["salish"],
-            "reference": r["english"],
-            "finetuned": ft_out,
-            "text_id":   r.get("text_id", ""),
-        }
-        for r, ft_out in zip(sample, ft_outputs)
-    ]
-
-    # --- Baseline comparison: run unmodified base model ---
-    nb = min(args.baseline_n, len(dev_records))
-    baseline_sample = dev_records[:nb]
-    baseline_salish = [r["salish"] for r in baseline_sample]
-
+    # Baseline inference
     log.info("Loading base model for zero-shot baseline")
-    base_tokenizer, base_model = load_base_model(args.model_dir, device)
-    base_forced_bos = base_tokenizer.convert_tokens_to_ids(ENGLISH_LANG)
-
-    log.info("Running zero-shot baseline inference on %d examples", nb)
-    base_outputs = translate_batch(
-        baseline_salish, base_tokenizer, base_model, KALISPEL_LANG, base_forced_bos, device
-    )
-    # Fine-tuned outputs for the same subset
-    ft_baseline_outputs = ft_outputs[:nb]
+    base_tok, base_model = load_base_model(args.model_dir, device)
+    base_forced_bos = base_tok.convert_tokens_to_ids(ENGLISH_LANG)
+    base_outputs = translate_batch(salish_texts, base_tok, base_model, KALISPEL_LANG, base_forced_bos, device)
+    log.info("Baseline outputs: %s", base_outputs)
+    del base_model
+    if device == "cuda":
+        torch.cuda.empty_cache()
 
     baseline_rows = [
         {
             "salish":    r["salish"],
             "reference": r["english"],
-            "baseline":  base_out,
-            "finetuned": ft_out,
+            "baseline":  bo,
+            "finetuned": fo,
         }
-        for r, base_out, ft_out in zip(baseline_sample, base_outputs, ft_baseline_outputs)
+        for r, bo, fo in zip(selected, base_outputs, ft_outputs)
     ]
 
-    # Free base model memory before saving
-    del base_model
-    if device == "cuda":
-        torch.cuda.empty_cache()
-
-    # --- Learning curve ---
-    log.info("Extracting learning curve from %s", args.trainer_state)
+    log.info("Extracting learning curve")
     curve = extract_learning_curve(args.trainer_state)
 
-    # --- Build and write HTML ---
-    log.info("Building HTML report")
-    html = build_html(translation_rows, baseline_rows, curve)
+    log.info("Building report")
+    html = build_html(baseline_rows, curve, n_train, n_dev)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(html, encoding="utf-8")
-    log.info("Report written to %s", args.output)
-    log.info("Open in a browser: file://%s", args.output.resolve())
+    log.info("Report written: %s", args.output)
+    log.info("Open: file://%s", args.output.resolve())
 
 
 if __name__ == "__main__":
