@@ -17,6 +17,8 @@ All inference is local. No network calls at runtime. MLflow tracking is local.
 from __future__ import annotations
 
 import argparse
+import csv
+import datetime
 import json
 import logging
 import os
@@ -158,6 +160,30 @@ def make_compute_metrics(tokenizer):
         }
 
     return compute_metrics
+
+
+# ---------------------------------------------------------------------------
+# Results CSV
+# ---------------------------------------------------------------------------
+
+RESULTS_CSV = Path("outputs/results.csv")
+
+CSV_FIELDS = [
+    "date", "run_name", "direction", "epochs", "lora_r", "lora_alpha",
+    "train_pairs", "dev_pairs", "lr", "batch_size", "grad_accum",
+    "train_loss", "dev_loss", "bleu", "chrf", "train_runtime_s", "adapter_path",
+]
+
+
+def append_results_csv(row: dict) -> None:
+    RESULTS_CSV.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not RESULTS_CSV.exists()
+    with open(RESULTS_CSV, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+    log.info("Results appended to %s", RESULTS_CSV)
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +376,36 @@ def train(
         mlflow.log_metrics({
             "final_bleu": eval_results.get("eval_bleu", 0.0),
             "final_chrf": eval_results.get("eval_chrf", 0.0),
+        })
+
+        train_metrics = trainer.state.log_history
+        train_loss = next(
+            (e["train_loss"] for e in reversed(train_metrics) if "train_loss" in e),
+            None,
+        )
+        runtime = next(
+            (e["train_runtime"] for e in reversed(train_metrics) if "train_runtime" in e),
+            None,
+        )
+
+        append_results_csv({
+            "date": datetime.date.today().isoformat(),
+            "run_name": run_name,
+            "direction": direction,
+            "epochs": epochs,
+            "lora_r": LORA_CONFIG.r,
+            "lora_alpha": LORA_CONFIG.lora_alpha,
+            "train_pairs": len(train_dataset),
+            "dev_pairs": len(dev_dataset),
+            "lr": lr,
+            "batch_size": batch_size,
+            "grad_accum": grad_accum,
+            "train_loss": round(train_loss, 4) if train_loss else "",
+            "dev_loss": round(eval_results.get("eval_loss", 0), 4),
+            "bleu": round(eval_results.get("eval_bleu", 0), 4),
+            "chrf": round(eval_results.get("eval_chrf", 0), 4),
+            "train_runtime_s": round(runtime, 1) if runtime else "",
+            "adapter_path": str(checkpoint_dir / "final"),
         })
 
     log.info("Training complete. Adapter saved to %s/final", checkpoint_dir)
