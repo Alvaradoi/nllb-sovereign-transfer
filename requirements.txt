@@ -9,6 +9,7 @@ datasets
 sentencepiece
 protobuf
 accelerate
+peft
 evaluate
 sacrebleu
 

@@ -43,6 +43,9 @@ CLAUDE.md
 .claude/settings.json
 .claude/settings.local.json
 
+# Private research log — chronological session record, not for public repo
+research_log.md
+
 # Allow slash command definitions — these are methodology docs, no data
 !.claude/
 !.claude/commands/
